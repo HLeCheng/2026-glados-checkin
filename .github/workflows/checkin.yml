@@ -2,13 +2,22 @@ name: GLaDOS 2026 Checkin
 
 on:
   schedule:
-    # 北京时间 9:30 (UTC 1:30)
+    # 北京时间 09:30（UTC 01:30）
     - cron: '30 1 * * *'
-    # 北京时间 21:30 (UTC 13:30)
+
+    # 北京时间 21:30（UTC 13:30）
     - cron: '30 13 * * *'
-  workflow_dispatch:  # 允许手动触发
+
+  # 允许手动运行
+  workflow_dispatch:
+
+  # main 分支更新时执行一次
   push:
-    branches: [main]  # 推送时也触发，保持活跃
+    branches:
+      - main
+
+permissions:
+  contents: read
 
 jobs:
   checkin:
@@ -33,15 +42,3 @@ jobs:
         timeout-minutes: 5
         env:
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
-          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-
-      - name: Retry on Failure
-        if: failure()
-        run: |
-          echo "First attempt failed, retrying in 60s..."
-          sleep 60
-          python checkin.py
-        timeout-minutes: 5
-        env:
-          GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
-          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
