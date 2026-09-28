@@ -61,16 +61,16 @@ def log(message):
 
 def extract_cookie(raw):
     """
-    提取 Cookie。
+    校验并返回完整 GLaDOS Cookie。
 
-    支持：
-    1. 完整 Cookie：
-       koa:sess=xxx; koa:sess.sig=yyy
+    必须同时包含：
+    - koa:sess=
+    - koa:sess.sig=
 
-    2. JSON：
-       {"token": "xxx"}
-
-    3. 单独 JWT / Token
+    不再接受：
+    - 单独 koa:sess
+    - 单独 token / JWT
+    - JSON token
     """
     if not raw:
         return None
@@ -80,52 +80,62 @@ def extract_cookie(raw):
     if not raw:
         return None
 
-    # 已经是完整 Cookie
-    if "koa:sess=" in raw or "koa:sess.sig=" in raw:
+    has_sess = "koa:sess=" in raw
+    has_sig = "koa:sess.sig=" in raw
+
+    if has_sess and has_sig:
         return raw
 
-    # JSON 格式
-    if raw.startswith("{"):
-        try:
-            data = json.loads(raw)
-            token = data.get("token")
+    if has_sess and not has_sig:
+        log(
+            "❌ GLADOS_COOKIE 不完整："
+            "已找到 koa:sess，但缺少 koa:sess.sig"
+        )
+        return None
 
-            if token:
-                return f"koa:sess={token}"
+    if has_sig and not has_sess:
+        log(
+            "❌ GLADOS_COOKIE 不完整："
+            "已找到 koa:sess.sig，但缺少 koa:sess"
+        )
+        return None
 
-        except (json.JSONDecodeError, AttributeError):
-            return None
-
-    # 单独 JWT Token
-    if raw.count(".") == 2 and "=" not in raw and len(raw) > 50:
-        return f"koa:sess={raw}"
-
-    # 其他格式原样使用
-    return raw
+    log(
+        "❌ GLADOS_COOKIE 格式错误："
+        "必须同时包含 koa:sess 和 koa:sess.sig"
+    )
+    return None
 
 
 def get_cookies():
-    """读取 GLADOS_COOKIE。"""
+    """读取并严格校验 GLADOS_COOKIE。"""
     raw = os.environ.get("GLADOS_COOKIE", "").strip()
 
     if not raw:
         log("❌ 未配置 GLADOS_COOKIE")
         return []
 
-    # 多账号：
-    # 推荐使用换行分隔，同时兼容旧版 & 分隔
+    # 多账号建议使用换行分隔。
+    # 同时保留对旧版 & 分隔方式的兼容。
     separator = "\n" if "\n" in raw else "&"
 
     cookies = []
 
-    for item in raw.split(separator):
+    for index, item in enumerate(raw.split(separator), 1):
+        item = item.strip()
+
+        if not item:
+            continue
+
         cookie = extract_cookie(item)
 
         if cookie:
             cookies.append(cookie)
+        else:
+            log(f"❌ 第 {index} 个账号的 Cookie 无效")
 
     if not cookies:
-        log("❌ GLADOS_COOKIE 格式无效")
+        log("❌ 没有找到有效的 GLADOS_COOKIE")
 
     return cookies
 
