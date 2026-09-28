@@ -1,278 +1,440 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-2026 GLaDOS 自动签到 (积分增强版)
+GLaDOS 自动签到
 
 功能：
-- 全自动签到
-- 精准获取当前积分 (Points)
-- PushPlus 微信推送（包含积分、剩余天数、签到结果）
-- 智能多域名切换 (优先 glados.cloud)
-- 支持 Cookie-Editor 导出格式
+- 使用 https://glados.cloud
+- 自动签到
+- 获取当前积分
+- 获取剩余会员天数
+- 支持多个 Cookie
+- 不发送 PushPlus / Telegram 等第三方通知
+- 正常签到时只输出日志
+- Cookie 失效、网络异常、API 异常、签到异常时：
+  返回非 0 退出码，让 GitHub Actions 标记为 Failure
 """
 
-import requests
 import json
 import os
 import sys
-import time
 from datetime import datetime
 
-# Fix Windows Unicode Output
-if sys.platform.startswith('win'):
-    sys.stdout.reconfigure(encoding='utf-8')
+import requests
+
+
+# Windows 终端 UTF-8
+if sys.platform.startswith("win"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 
 # ================= 配置 =================
 
-# 域名优先级：Cloud 第一
-DOMAINS = [
-    "https://glados.cloud",
-    "https://glados.rocks", 
-    "https://glados.network",
-]
+BASE_URL = "https://glados.cloud"
 
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Content-Type': 'application/json;charset=UTF-8',
-    'Accept': 'application/json, text/plain, */*',
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
 }
+
+
+# 已知正常签到返回
+NORMAL_CHECKIN_MESSAGES = (
+    "checkin! got",
+    "checkin repeats! please try tomorrow",
+    "today's observation logged",
+)
+
 
 # ================= 工具函数 =================
 
-def log(msg):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}")
+def log(message):
+    """输出带时间戳的日志。"""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] {message}", flush=True)
 
-def extract_cookie(raw: str):
-    """提取 Cookie，支持 Cookie-Editor 冒号格式"""
-    if not raw: return None
+
+def extract_cookie(raw):
+    """
+    提取 Cookie。
+
+    支持：
+    1. 完整 Cookie：
+       koa:sess=xxx; koa:sess.sig=yyy
+
+    2. JSON：
+       {"token": "xxx"}
+
+    3. 单独 JWT / Token
+    """
+    if not raw:
+        return None
+
     raw = raw.strip()
-    
-    # Cookie-Editor 格式 (koa:sess=xxx; koa:sess.sig=yyy)
-    if 'koa:sess=' in raw or 'koa:sess.sig=' in raw:
+
+    if not raw:
+        return None
+
+    # 已经是完整 Cookie
+    if "koa:sess=" in raw or "koa:sess.sig=" in raw:
         return raw
-        
-    # JSON
-    if raw.startswith('{'):
+
+    # JSON 格式
+    if raw.startswith("{"):
         try:
-            return 'koa.sess=' + json.loads(raw).get('token')
-        except: pass
-        
-    # JWT Token
-    if raw.count('.') == 2 and '=' not in raw and len(raw) > 50:
-        return 'koa:sess=' + raw
-        
-    # Standard
+            data = json.loads(raw)
+            token = data.get("token")
+
+            if token:
+                return f"koa:sess={token}"
+
+        except (json.JSONDecodeError, AttributeError):
+            return None
+
+    # 单独 JWT Token
+    if raw.count(".") == 2 and "=" not in raw and len(raw) > 50:
+        return f"koa:sess={raw}"
+
+    # 其他格式原样使用
     return raw
 
+
 def get_cookies():
-    raw = os.environ.get("GLADOS_COOKIE", "")
+    """读取 GLADOS_COOKIE。"""
+    raw = os.environ.get("GLADOS_COOKIE", "").strip()
+
     if not raw:
         log("❌ 未配置 GLADOS_COOKIE")
         return []
-    
-    # Split by enter or &
-    sep = '\n' if '\n' in raw else '&'
-    return [extract_cookie(c) for c in raw.split(sep) if c.strip()]
 
-# ================= 核心逻辑 =================
+    # 多账号：
+    # 推荐使用换行分隔，同时兼容旧版 & 分隔
+    separator = "\n" if "\n" in raw else "&"
+
+    cookies = []
+
+    for item in raw.split(separator):
+        cookie = extract_cookie(item)
+
+        if cookie:
+            cookies.append(cookie)
+
+    if not cookies:
+        log("❌ GLADOS_COOKIE 格式无效")
+
+    return cookies
+
+
+def is_normal_checkin_result(result):
+    """
+    判断签到结果是否正常。
+
+    正常情况包括：
+    - 本次签到成功
+    - 今天已经签到过
+    """
+    if not isinstance(result, dict):
+        return False
+
+    message = str(result.get("message", "")).strip().lower()
+
+    return any(
+        marker in message
+        for marker in NORMAL_CHECKIN_MESSAGES
+    )
+
+
+# ================= GLaDOS API =================
 
 class GLaDOS:
     def __init__(self, cookie):
         self.cookie = cookie
-        self.domain = DOMAINS[0]
-        self.email = "?"
-        self.left_days = "?"
         self.points = "?"
-        self.points_change = "?"
-        self.exchange_info = ""
-        self.plan = "?"
-        
-    def req(self, method, path, data=None):
-        """带自动域名切换的请求"""
-        for d in DOMAINS:
-            try:
-                url = f"{d}{path}"
-                h = HEADERS.copy()
-                h['Cookie'] = self.cookie
-                h['Origin'] = d
-                h['Referer'] = f"{d}/console/checkin"
-                
-                if method == 'GET':
-                    resp = requests.get(url, headers=h, timeout=10)
-                else:
-                    resp = requests.post(url, headers=h, json=data, timeout=10)
-                
-                if resp.status_code == 200:
-                    self.domain = d # Remember working domain
-                    return resp.json()
-            except Exception as e:
-                log(f"⚠️ {d} 请求失败: {e}")
-                continue
-        return None
+        self.left_days = "?"
 
-    def get_status(self):
-        """获取状态：天数、邮箱"""
-        res = self.req('GET', '/api/user/status')
-        if res and 'data' in res:
-            d = res['data']
-            self.email = d.get('email', 'Unknown')
-            self.left_days = str(d.get('leftDays', '?')).split('.')[0]
-            return True
-        return False
+    def request(self, method, path, data=None):
+        """
+        请求 glados.cloud API。
 
-    def get_points(self):
-        """获取积分、变化历史、兑换计划"""
-        res = self.req('GET', '/api/user/points')
-        if res and 'points' in res:
-            # 当前积分
-            self.points = str(res.get('points', '0')).split('.')[0]
-            
-            # 最近一次积分变化
-            history = res.get('history', [])
-            if history:
-                last = history[0]
-                change = str(last.get('change', '0')).split('.')[0]
-                if not change.startswith('-'):
-                    change = '+' + change
-                self.points_change = change
-            
-            # 兑换计划
-            plans = res.get('plans', {})
-            pts = int(self.points)
-            exchange_lines = []
-            for plan_id, plan_data in plans.items():
-                need = plan_data['points']
-                days = plan_data['days']
-                if pts >= need:
-                    exchange_lines.append(f"✅ {need}分→{days}天 (可兑换)")
-                else:
-                    exchange_lines.append(f"❌ {need}分→{days}天 (差{need-pts}分)")
-            self.exchange_info = "<br>".join(exchange_lines)
-            return True
-        return False
+        返回：
+            dict -> 请求及 JSON 解析成功
+            None -> 网络 / HTTP / JSON 异常
+        """
+
+        url = f"{BASE_URL}{path}"
+
+        headers = HEADERS.copy()
+
+        headers["Cookie"] = self.cookie
+        headers["Origin"] = BASE_URL
+        headers["Referer"] = f"{BASE_URL}/console/checkin"
+
+        try:
+            if method == "GET":
+                response = requests.get(
+                    url,
+                    headers=headers,
+                    timeout=15,
+                )
+
+            elif method == "POST":
+                headers["Content-Type"] = (
+                    "application/json;charset=UTF-8"
+                )
+
+                response = requests.post(
+                    url,
+                    headers=headers,
+                    json=data,
+                    timeout=15,
+                )
+
+            else:
+                log(f"❌ 不支持的 HTTP 方法: {method}")
+                return None
+
+        except requests.Timeout:
+            log(f"❌ 请求超时: {url}")
+            return None
+
+        except requests.ConnectionError as exc:
+            log(f"❌ 网络连接失败: {exc}")
+            return None
+
+        except requests.RequestException as exc:
+            log(f"❌ HTTP 请求异常: {exc}")
+            return None
+
+        # Cookie / Session 常见失效状态
+        if response.status_code in (401, 403):
+            log(
+                f"❌ HTTP {response.status_code}: "
+                "Cookie 可能已过期或登录状态已失效"
+            )
+            return None
+
+        if response.status_code != 200:
+            log(
+                f"❌ API 返回异常状态码: "
+                f"HTTP {response.status_code}"
+            )
+            return None
+
+        try:
+            result = response.json()
+
+        except ValueError:
+            log("❌ API 返回内容不是有效 JSON")
+            return None
+
+        if not isinstance(result, dict):
+            log("❌ API 返回的数据结构异常")
+            return None
+
+        return result
 
     def checkin(self):
-        """执行签到"""
-        return self.req('POST', '/api/user/checkin', {'token': 'glados.cloud'})
+        """执行签到。"""
+        return self.request(
+            "POST",
+            "/api/user/checkin",
+            {
+                "token": "glados.cloud",
+            },
+        )
+
+    def get_status(self):
+        """获取剩余会员天数。"""
+        result = self.request(
+            "GET",
+            "/api/user/status",
+        )
+
+        if not isinstance(result, dict):
+            return False
+
+        data = result.get("data")
+
+        if not isinstance(data, dict):
+            log("❌ 状态接口缺少 data")
+            return False
+
+        left_days = data.get("leftDays")
+
+        if left_days is None:
+            log("❌ 状态接口没有返回 leftDays")
+            return False
+
+        try:
+            self.left_days = str(
+                int(float(left_days))
+            )
+
+        except (TypeError, ValueError):
+            log(
+                f"❌ 无法解析剩余天数: "
+                f"{left_days}"
+            )
+            return False
+
+        return True
+
+    def get_points(self):
+        """获取当前积分。"""
+        result = self.request(
+            "GET",
+            "/api/user/points",
+        )
+
+        if not isinstance(result, dict):
+            return False
+
+        points = result.get("points")
+
+        if points is None:
+            log("❌ 积分接口没有返回 points")
+            return False
+
+        try:
+            self.points = str(
+                int(float(points))
+            )
+
+        except (TypeError, ValueError):
+            log(
+                f"❌ 无法解析积分: "
+                f"{points}"
+            )
+            return False
+
+        return True
+
 
 # ================= 主程序 =================
 
-def pushplus(token, title, content):
-    if not token: return
-    try:
-        url = "http://www.pushplus.plus/send"
-        requests.get(url, params={'token': token, 'title': title, 'content': content, 'template': 'html'}, timeout=5)
-        log("✅ PushPlus 推送成功")
-    except:
-        log("❌ PushPlus 推送失败")
+def run_account(index, total, cookie):
+    """
+    执行单个账号。
 
-def telegram_push(token, chat_id, title, content):
-    if not token or not chat_id: return
-    try:
-        import re
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        # Convert HTML to be Telegram-compatible
-        text = f"<b>{title}</b>\n\n{content}"
-        
-        # 1. Block elements replacements (handle tags with attributes)
-        text = text.replace("<br>", "\n")
-        # Handle H3 tags
-        text = re.sub(r"<h3[^>]*>", "<b>", text)
-        text = text.replace("</h3>", "</b>\n")
-        
-        # 2. Paragraph and Div tags
-        text = re.sub(r"<(div|p)[^>]*>", "", text)
-        text = re.sub(r"</(div|p)>", "\n", text)
-        
-        # 3. Span and small tags
-        text = re.sub(r"<(span|small)[^>]*>", "", text)
-        text = re.sub(r"</(span|small)>", "", text)
-        
-        # 4. Final cleaning: Strip all HTML tags EXCEPT the ones supported by Telegram: b, i, u, s, a, code, pre
-        text = re.sub(r"<(?!\/?(b|i|u|s|a|code|pre)\b)[^>]+>", "", text)
-        
-        # 5. Dedent each line to fix alignment issues caused by HTML template indentation
-        lines = [line.strip() for line in text.split('\n')]
-        text = "\n".join(lines)
-        
-        # 6. Collapse multiple newlines
-        text = re.sub(r"\n\s*\n", "\n\n", text).strip()
-        
-        data = {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML"
-        }
-        log(f"发送内容: {data}")
-        resp=requests.post(url, json=data, timeout=5)
-        if resp.status_code != 200:
-            log(f"❌ Telegram 推送失败: {resp.json()}")
-            return
-        log("✅ Telegram 推送成功")
-    except Exception as e:
-        log(f"❌ Telegram 推送失败: {e}")
+    返回：
+        True  -> 完全正常
+        False -> 任意环节异常
+    """
+
+    log(f"---------- 账号 {index}/{total} ----------")
+
+    client = GLaDOS(cookie)
+
+    # ======================
+    # 1. 签到
+    # ======================
+
+    checkin_result = client.checkin()
+
+    if checkin_result is None:
+        log(f"❌ 账号 {index} 签到请求失败")
+        return False
+
+    message = str(
+        checkin_result.get("message", "")
+    ).strip()
+
+    if not is_normal_checkin_result(checkin_result):
+        log(
+            f"❌ 账号 {index} 签到返回异常 | "
+            f"结果: {message or 'Unknown'}"
+        )
+        return False
+
+    # ======================
+    # 2. 获取剩余天数
+    # ======================
+
+    if not client.get_status():
+        log(
+            f"❌ 账号 {index} 状态接口异常，"
+            "无法获取剩余天数"
+        )
+        return False
+
+    # ======================
+    # 3. 获取积分
+    # ======================
+
+    if not client.get_points():
+        log(
+            f"❌ 账号 {index} 积分接口异常，"
+            "无法获取当前积分"
+        )
+        return False
+
+    # ======================
+    # 全部正常
+    # ======================
+
+    log(
+        f"✅ 账号 {index} | "
+        f"积分: {client.points} | "
+        f"剩余天数: {client.left_days} | "
+        f"结果: {message}"
+    )
+
+    return True
+
 
 def main():
-    log("🚀 2026 GLaDOS Checkin Starting...")
+    log("🚀 GLaDOS Checkin Starting...")
+
     cookies = get_cookies()
-    if not cookies: sys.exit(1)
-    
-    results = []
-    success_cnt = 0
-    
-    for i, cookie in enumerate(cookies, 1):
-        g = GLaDOS(cookie)
-        
-        # 1. Checkin
-        res = g.checkin()
-        msg = res.get('message', 'Failure') if res else "Network Error"
-        
-        # 2. Get Info (Refresh data)
-        g.get_status()
-        g.get_points()
-        
-        # 3. Log
-        status_icon = "✅" if "Checkin" in msg else "⚠️"
-        log(f"用户: {g.email} | 积分: {g.points} | 天数: {g.left_days} | 结果: {msg}")
-        
-        if "Checkin" in msg: success_cnt += 1
-        
-        # 4. Result Formatting
-        results.append(f"""
-<div style="border:2px solid #333; padding:15px; margin-bottom:15px; border-radius:10px; background:#fff;">
-    <h3 style="margin:0 0 15px 0; color:#333; border-bottom:2px solid #333; padding-bottom:8px;">👤 {g.email}</h3>
-    <p style="margin:8px 0; color:#000; font-size:16px;"><b>当前积分:</b> <span style="color:#e74c3c; font-size:22px; font-weight:bold;">{g.points}</span> <span style="color:#27ae60; font-weight:bold;">({g.points_change})</span></p>
-    <p style="margin:8px 0; color:#000; font-size:16px;"><b>剩余天数:</b> <span style="font-weight:bold;">{g.left_days} 天</span></p>
-    <p style="margin:8px 0; color:#000; font-size:16px;"><b>签到结果:</b> {msg}</p>
-    <div style="margin-top:15px; padding:12px; background:#f0f0f0; border-radius:8px; border:1px solid #ccc;">
-        <p style="margin:0 0 8px 0; color:#333; font-weight:bold; font-size:15px;">🎁 兑换选项:</p>
-        <p style="margin:0; color:#000; font-size:14px; line-height:1.8;">
-{g.exchange_info}</p>
-    </div>
-</div>
-""")
 
-    # Push
-    push_level = os.environ.get("PUSH_LEVEL", "all").lower()
-    
-    if push_level == "fail_only" and success_cnt == len(cookies):
-        log("⏭️ 根据 PUSH_LEVEL=fail_only 设置，所有账号签到成功，跳过推送")
-        return
+    if not cookies:
+        log("❌ 无可用 Cookie，程序终止")
+        return 1
 
-    ptoken = os.environ.get("PUSHPLUS_TOKEN")
-    tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    
-    if ptoken or (tg_token and tg_chat_id):
-        title = f"GLaDOS签到: 成功{success_cnt}/{len(cookies)}"
-        content = "".join(results)
-        content += f"<br><small>时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</small>"
-        
-        if ptoken:
-            pushplus(ptoken, title, content)
-        if tg_token and tg_chat_id:
-            telegram_push(tg_token, tg_chat_id, title, content)
+    total = len(cookies)
+    success_count = 0
 
-if __name__ == '__main__':
-    main()
+    for index, cookie in enumerate(cookies, 1):
+        try:
+            if run_account(
+                index,
+                total,
+                cookie,
+            ):
+                success_count += 1
+
+        except Exception as exc:
+            # 防止未知程序异常被误判成成功
+            log(
+                f"❌ 账号 {index} "
+                f"发生未处理异常: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    log("----------------------------------------")
+
+    if success_count == total:
+        log(
+            f"✅ 全部账号运行正常 "
+            f"({success_count}/{total})"
+        )
+
+        # GitHub Actions -> Success
+        return 0
+
+    log(
+        f"❌ 存在异常账号 "
+        f"({success_count}/{total})"
+    )
+
+    # GitHub Actions -> Failure
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
