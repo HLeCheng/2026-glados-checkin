@@ -4,15 +4,14 @@
 """
 GLaDOS 自动签到
 
-设计目标：
-- 只使用 https://glados.cloud
-- GLADOS_COOKIE 必须同时包含 koa:sess 和 koa:sess.sig
-- 首先调用 /api/user/status 验证 Cookie / Session
-- 再调用 /api/user/checkin 执行签到
-- 最后调用 /api/user/points 获取积分
-- 正常运行时输出积分和剩余天数
-- Cookie、网络、API、签到等任意异常时返回 exit code 1
-- 不发送 PushPlus / Telegram 等第三方通知
+目标：
+- 仅使用 https://glados.cloud
+- 支持 koa:* / gld:* Session Cookie
+- 先验证登录状态，再签到，再读取积分
+- 签到成功与否主要依据 API 结构化 code，而不是固定 message 文案
+- 正常时在 GitHub Actions 日志显示积分、剩余天数、签到结果
+- Cookie / 网络 / API / 签到异常时返回 exit code 1
+- 不使用 PushPlus / Telegram 等第三方通知
 """
 
 import os
@@ -27,7 +26,9 @@ if sys.platform.startswith("win"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 
-# ================= 配置 =================
+# ============================================================
+# 配置
+# ============================================================
 
 BASE_URL = "https://glados.cloud"
 
@@ -38,18 +39,12 @@ HEADERS = {
         "Chrome/120.0.0.0 Safari/537.36"
     ),
     "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
 
 
-# 已知正常签到结果
-NORMAL_CHECKIN_MESSAGES = (
-    "checkin! got",
-    "checkin repeats! please try tomorrow",
-    "today's observation logged",
-)
-
-
-# 用于识别登录 / 鉴权失败
+# 这里只用于识别明显的鉴权错误。
+# 不用于判断签到“成功”。
 AUTH_ERROR_MARKERS = (
     "没有权限",
     "无权限",
@@ -59,35 +54,41 @@ AUTH_ERROR_MARKERS = (
     "登录过期",
     "unauthorized",
     "forbidden",
+    "permission denied",
     "not authorized",
-    "not login",
     "not logged in",
+    "not login",
     "login required",
 )
 
 
-# ================= 日志 =================
+# ============================================================
+# 日志
+# ============================================================
 
 def log(message):
-    """输出带时间戳日志。"""
+    """输出带时间戳的日志。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{now}] {message}", flush=True)
 
 
-# ================= Cookie =================
+# ============================================================
+# Cookie
+# ============================================================
 
-def extract_cookie(raw):
+def inspect_cookie(raw, index):
     """
-    严格检查 GLaDOS Cookie。
+    检查 Cookie 中已知的 Session 项。
 
-    必须同时包含：
-    - koa:sess
-    - koa:sess.sig
+    注意：
+    这里只做诊断，不把已知 Cookie 名称当成最终鉴权标准。
 
-    不接受：
-    - 单独 koa:sess
-    - 单独 Token / JWT
-    - JSON Token
+    真正是否登录有效，最终由：
+        GET /api/user/status
+    判断。
+
+    这样即使未来 GLaDOS 再修改 Cookie 名称，
+    也不会因为本地白名单导致有效 Cookie 被直接拒绝。
     """
     if not raw:
         return None
@@ -110,44 +111,61 @@ def extract_cookie(raw):
         key = key.strip()
         value = value.strip()
 
-        cookie_items[key] = value
+        if key:
+            cookie_items[key] = value
 
-    sess = cookie_items.get("koa:sess")
-    sess_sig = cookie_items.get("koa:sess.sig")
+    # koa Session
+    has_koa_sess = bool(cookie_items.get("koa:sess"))
+    has_koa_sig = bool(cookie_items.get("koa:sess.sig"))
+    koa_complete = has_koa_sess and has_koa_sig
 
-    if not sess and not sess_sig:
+    # gld Session
+    has_gld_sess = bool(cookie_items.get("gld:sess"))
+    has_gld_sig = bool(cookie_items.get("gld:sess.sig"))
+    gld_complete = has_gld_sess and has_gld_sig
+
+    # 某组只有一半时给出警告，但仍交给服务器验证
+    if has_koa_sess != has_koa_sig:
         log(
-            "❌ GLADOS_COOKIE 格式错误："
-            "没有找到 koa:sess 和 koa:sess.sig"
+            f"⚠️ 账号 {index}: "
+            "检测到 koa Session Cookie 不完整"
         )
-        return None
 
-    if not sess:
+    if has_gld_sess != has_gld_sig:
         log(
-            "❌ GLADOS_COOKIE 不完整："
-            "缺少 koa:sess"
+            f"⚠️ 账号 {index}: "
+            "检测到 gld Session Cookie 不完整"
         )
-        return None
 
-    if not sess_sig:
+    log(
+        f"🔐 账号 {index} Cookie Session | "
+        f"koa={'✅' if koa_complete else '—'} | "
+        f"gld={'✅' if gld_complete else '—'}"
+    )
+
+    if not koa_complete and not gld_complete:
         log(
-            "❌ GLADOS_COOKIE 不完整："
-            "缺少 koa:sess.sig"
+            f"⚠️ 账号 {index}: "
+            "没有识别到完整的 koa/gld Session，"
+            "继续交由 glados.cloud 实际验证"
         )
-        return None
 
+    # 不修改用户提供的 Cookie
+    # 完整原样发送给 glados.cloud
     return raw
 
 
 def get_cookies():
     """
-    从环境变量读取 Cookie。
+    从 GLADOS_COOKIE 环境变量读取 Cookie。
 
     单账号：
-        直接填写完整 Cookie
+        一个完整 Cookie
 
     多账号：
         每行一个完整 Cookie
+
+    不再使用 & 分隔，避免 Cookie 本身包含特殊字符时被误拆。
     """
     raw = os.environ.get("GLADOS_COOKIE", "").strip()
 
@@ -155,37 +173,33 @@ def get_cookies():
         log("❌ 未配置 GLADOS_COOKIE")
         return []
 
-    # 多账号使用换行分隔
-    items = raw.splitlines()
+    items = [
+        item.strip()
+        for item in raw.splitlines()
+        if item.strip()
+    ]
+
+    if not items:
+        log("❌ GLADOS_COOKIE 为空")
+        return []
 
     cookies = []
 
     for index, item in enumerate(items, 1):
-        item = item.strip()
-
-        if not item:
-            continue
-
-        cookie = extract_cookie(item)
+        cookie = inspect_cookie(item, index)
 
         if cookie:
             cookies.append(cookie)
-        else:
-            log(
-                f"❌ 第 {index} 个账号的 Cookie "
-                "格式检查失败"
-            )
-
-    if not cookies:
-        log("❌ 没有找到有效的 GLADOS_COOKIE")
 
     return cookies
 
 
-# ================= API 判断 =================
+# ============================================================
+# API 工具
+# ============================================================
 
 def get_api_message(result):
-    """安全读取 API message。"""
+    """安全获取 API message。"""
     if not isinstance(result, dict):
         return ""
 
@@ -195,23 +209,36 @@ def get_api_message(result):
 
 
 def get_api_code(result):
-    """安全读取 API code。"""
-    if not isinstance(result, dict):
-        return "?"
+    """
+    获取 API code。
 
-    return str(
-        result.get("code", "?")
-    )
+    返回：
+        int  -> 可以正常解析
+        None -> 缺少或无法解析
+    """
+    if not isinstance(result, dict):
+        return None
+
+    value = result.get("code")
+
+    if value is None:
+        return None
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def is_auth_failure(result):
     """
-    判断 API JSON 是否明确表示鉴权失败。
+    根据 message 判断是否属于明显鉴权失败。
 
-    注意：
-    GLaDOS 可能使用 HTTP 200 +
-    {"message": "没有权限"}
-    来表示鉴权失败。
+    GLaDOS 有时可能：
+        HTTP 200
+        + JSON message="没有权限"
+
+    所以不能只看 HTTP 状态码。
     """
     message = get_api_message(result).lower()
 
@@ -224,38 +251,24 @@ def is_auth_failure(result):
     )
 
 
-def is_normal_checkin_result(result):
-    """判断是否属于正常签到结果。"""
-    if not isinstance(result, dict):
-        return False
-
-    message = get_api_message(result).lower()
-
-    return any(
-        marker in message
-        for marker in NORMAL_CHECKIN_MESSAGES
-    )
-
-
 def safe_result_description(result):
     """
-    输出 API 的安全诊断信息。
+    生成安全的 API 诊断信息。
 
-    只显示：
+    只输出：
     - code
     - message
-    - JSON 顶层字段名称
+    - JSON 顶层字段名
 
-    不输出 data 内容，
-    避免把邮箱等账号信息写进公开 Actions 日志。
+    不输出 data 内容，避免公开 Actions 日志泄露账号信息。
     """
     if not isinstance(result, dict):
         return "非 JSON 对象"
 
-    code = get_api_code(result)
+    code = result.get("code", "?")
     message = get_api_message(result) or "(空)"
 
-    keys = ", ".join(
+    fields = ", ".join(
         str(key)
         for key in result.keys()
     )
@@ -263,18 +276,48 @@ def safe_result_description(result):
     return (
         f"code={code}, "
         f"message={message}, "
-        f"fields=[{keys}]"
+        f"fields=[{fields}]"
     )
 
 
-# ================= GLaDOS API =================
+def is_normal_checkin_result(result):
+    """
+    判断签到接口是否属于正常状态。
+
+    当前结构化状态：
+        code == 0 -> 本次签到成功
+        code == 1 -> 重复签到 / 今日已经签到
+
+    重要：
+    - 不匹配具体成功 message
+    - message 改文案不会影响判断
+    - 明显鉴权失败始终优先判定为失败
+    - 未知 code 保守地判定为失败
+    """
+    if not isinstance(result, dict):
+        return False
+
+    # 必须先排除类似：
+    # code=1 + message="没有权限"
+    # 这种潜在情况
+    if is_auth_failure(result):
+        return False
+
+    code = get_api_code(result)
+
+    return code in (0, 1)
+
+
+# ============================================================
+# GLaDOS API
+# ============================================================
 
 class GLaDOS:
     def __init__(self, cookie):
         self.cookie = cookie
 
-        self.points = "?"
         self.left_days = "?"
+        self.points = "?"
 
     def request(self, method, path, data=None):
         """
@@ -286,7 +329,6 @@ class GLaDOS:
         网络 / HTTP / JSON 异常：
             返回 None
         """
-
         url = f"{BASE_URL}{path}"
 
         headers = HEADERS.copy()
@@ -297,32 +339,19 @@ class GLaDOS:
             f"{BASE_URL}/console/checkin"
         )
 
+        if method == "POST":
+            headers["Content-Type"] = (
+                "application/json;charset=UTF-8"
+            )
+
         try:
-            if method == "GET":
-                response = requests.get(
-                    url,
-                    headers=headers,
-                    timeout=15,
-                )
-
-            elif method == "POST":
-                headers["Content-Type"] = (
-                    "application/json;charset=UTF-8"
-                )
-
-                response = requests.post(
-                    url,
-                    headers=headers,
-                    json=data,
-                    timeout=15,
-                )
-
-            else:
-                log(
-                    f"❌ 不支持的 HTTP 方法: "
-                    f"{method}"
-                )
-                return None
+            response = requests.request(
+                method=method,
+                url=url,
+                headers=headers,
+                json=data if method == "POST" else None,
+                timeout=15,
+            )
 
         except requests.Timeout:
             log(
@@ -351,18 +380,13 @@ class GLaDOS:
                 f"HTTP {response.status_code} | "
                 "服务器拒绝访问"
             )
-
             return None
 
+        # 其他非 200
         if response.status_code != 200:
-            # 尝试提取服务端 message，
-            # 但绝不打印 Cookie
             try:
                 result = response.json()
-
-                detail = safe_result_description(
-                    result
-                )
+                detail = safe_result_description(result)
 
             except ValueError:
                 detail = "响应不是 JSON"
@@ -372,9 +396,9 @@ class GLaDOS:
                 f"HTTP {response.status_code} | "
                 f"{detail}"
             )
-
             return None
 
+        # HTTP 200，继续解析 JSON
         try:
             result = response.json()
 
@@ -394,18 +418,17 @@ class GLaDOS:
 
         return result
 
-    # =============================
-    # 1. 登录状态 / Cookie 鉴权
-    # =============================
+    # --------------------------------------------------------
+    # 1. 验证登录状态
+    # --------------------------------------------------------
 
     def get_status(self):
         """
         获取账号状态。
 
-        这是整个流程的第一步，
-        用于判断 Cookie 是否具有基本登录权限。
+        这是整个流程的第一步：
+        由服务器实际判断 Cookie / Session 是否有效。
         """
-
         path = "/api/user/status"
 
         result = self.request(
@@ -415,36 +438,19 @@ class GLaDOS:
 
         if result is None:
             log(
-                "❌ 无法完成 Cookie 鉴权检查"
+                "❌ 无法完成 Cookie / Session 鉴权检查"
             )
-
             return False
 
-        # HTTP 200，但 JSON 明确表示没权限
+        # HTTP 200 但 API 明确拒绝
         if is_auth_failure(result):
             log(
                 "❌ Cookie / Session 鉴权失败"
             )
-
-            log(
-                f"   接口: GET {path}"
-            )
-
-            log(
-                "   HTTP: 200"
-            )
-
             log(
                 f"   API: "
                 f"{safe_result_description(result)}"
             )
-
-            log(
-                "   判断: 登录 Cookie 已失效、"
-                "不完整，或 glados.cloud "
-                "不认可当前 Session"
-            )
-
             return False
 
         data = result.get("data")
@@ -453,20 +459,10 @@ class GLaDOS:
             log(
                 "❌ 状态接口返回异常"
             )
-
-            log(
-                f"   接口: GET {path}"
-            )
-
-            log(
-                "   HTTP: 200"
-            )
-
             log(
                 f"   API: "
                 f"{safe_result_description(result)}"
             )
-
             return False
 
         left_days = data.get("leftDays")
@@ -475,12 +471,10 @@ class GLaDOS:
             log(
                 "❌ 状态接口没有返回 leftDays"
             )
-
             log(
                 f"   API: "
                 f"{safe_result_description(result)}"
             )
-
             return False
 
         try:
@@ -490,9 +484,9 @@ class GLaDOS:
 
         except (TypeError, ValueError):
             log(
-                "❌ 无法解析剩余天数"
+                f"❌ 无法解析剩余天数: "
+                f"{left_days}"
             )
-
             return False
 
         log(
@@ -502,15 +496,16 @@ class GLaDOS:
 
         return True
 
-    # =============================
+    # --------------------------------------------------------
     # 2. 签到
-    # =============================
+    # --------------------------------------------------------
 
     def checkin(self):
         """
-        执行签到并详细检查返回结果。
-        """
+        执行签到。
 
+        不依赖 message 文案判断成功。
+        """
         path = "/api/user/checkin"
 
         result = self.request(
@@ -522,70 +517,53 @@ class GLaDOS:
         )
 
         if result is None:
-            log(
-                "❌ 签到接口请求失败"
-            )
-
-            return False, ""
+            log("❌ 签到接口请求失败")
+            return False, "", None
 
         message = get_api_message(result)
+        code = get_api_code(result)
 
-        # 登录状态接口已经成功，
-        # 但签到接口单独返回没有权限
+        # 即使 code 看起来正常，也优先排除明显权限问题
         if is_auth_failure(result):
             log(
-                "❌ 签到接口单独发生权限拒绝"
+                "❌ 签到接口发生权限拒绝"
             )
-
-            log(
-                f"   接口: POST {path}"
-            )
-
-            log(
-                "   HTTP: 200"
-            )
-
             log(
                 f"   API: "
                 f"{safe_result_description(result)}"
             )
-
-            log(
-                "   判断: Cookie 已通过 status "
-                "接口鉴权，但 checkin 接口拒绝操作"
-            )
-
-            return False, message
+            return False, message, code
 
         if not is_normal_checkin_result(result):
             log(
-                "❌ 签到接口返回未知/异常结果"
+                "❌ 签到接口返回异常状态"
             )
-
-            log(
-                f"   接口: POST {path}"
-            )
-
-            log(
-                "   HTTP: 200"
-            )
-
             log(
                 f"   API: "
                 f"{safe_result_description(result)}"
             )
+            return False, message, code
 
-            return False, message
+        if code == 0:
+            log(
+                "✅ 签到接口返回成功状态 "
+                "(code=0)"
+            )
 
-        return True, message
+        elif code == 1:
+            log(
+                "✅ 今日已签到 / 重复签到 "
+                "(code=1)"
+            )
 
-    # =============================
-    # 3. 积分
-    # =============================
+        return True, message, code
+
+    # --------------------------------------------------------
+    # 3. 获取积分
+    # --------------------------------------------------------
 
     def get_points(self):
-        """获取当前积分。"""
-
+        """读取当前积分。"""
         path = "/api/user/points"
 
         result = self.request(
@@ -597,27 +575,16 @@ class GLaDOS:
             log(
                 "❌ 积分接口请求失败"
             )
-
             return False
 
         if is_auth_failure(result):
             log(
                 "❌ 积分接口发生权限拒绝"
             )
-
-            log(
-                f"   接口: GET {path}"
-            )
-
-            log(
-                "   HTTP: 200"
-            )
-
             log(
                 f"   API: "
                 f"{safe_result_description(result)}"
             )
-
             return False
 
         points = result.get("points")
@@ -626,12 +593,10 @@ class GLaDOS:
             log(
                 "❌ 积分接口没有返回 points"
             )
-
             log(
                 f"   API: "
                 f"{safe_result_description(result)}"
             )
-
             return False
 
         try:
@@ -641,34 +606,30 @@ class GLaDOS:
 
         except (TypeError, ValueError):
             log(
-                f"❌ 无法解析积分值: "
+                f"❌ 无法解析积分: "
                 f"{points}"
             )
-
             return False
 
         return True
 
 
-# ================= 单账号 =================
+# ============================================================
+# 单账号流程
+# ============================================================
 
 def run_account(index, total, cookie):
     """
-    单账号流程：
+    单账号执行顺序：
 
-    1. status
-       ↓
-       判断 Cookie 是否有效
-
-    2. checkin
-       ↓
-       判断签到接口是否有权限
-
-    3. points
-       ↓
-       获取积分
+        Cookie
+          ↓
+        /status
+          ↓
+        /checkin
+          ↓
+        /points
     """
-
     log(
         f"---------- 账号 "
         f"{index}/{total} ----------"
@@ -676,10 +637,7 @@ def run_account(index, total, cookie):
 
     client = GLaDOS(cookie)
 
-    # ---------------------------------
-    # Step 1：首先验证 Cookie
-    # ---------------------------------
-
+    # Step 1
     log(
         "🔎 Step 1/3: "
         "检查 Cookie / Session 权限"
@@ -690,32 +648,24 @@ def run_account(index, total, cookie):
             f"❌ 账号 {index} "
             "基础鉴权失败，停止后续请求"
         )
-
         return False
 
-    # ---------------------------------
-    # Step 2：签到
-    # ---------------------------------
-
+    # Step 2
     log(
         "🔎 Step 2/3: "
-        "检查签到接口权限并执行签到"
+        "执行签到"
     )
 
-    checkin_ok, message = client.checkin()
+    checkin_ok, message, code = client.checkin()
 
     if not checkin_ok:
         log(
             f"❌ 账号 {index} "
             "签到失败"
         )
-
         return False
 
-    # ---------------------------------
-    # Step 3：积分
-    # ---------------------------------
-
+    # Step 3
     log(
         "🔎 Step 3/3: "
         "读取当前积分"
@@ -726,24 +676,29 @@ def run_account(index, total, cookie):
             f"❌ 账号 {index} "
             "积分接口异常"
         )
-
         return False
 
-    # ---------------------------------
-    # 全部成功
-    # ---------------------------------
+    # 全部正常
+    display_message = (
+        message
+        if message
+        else "(服务器未返回 message)"
+    )
 
     log(
         f"✅ 账号 {index} | "
         f"积分: {client.points} | "
         f"剩余天数: {client.left_days} | "
-        f"签到结果: {message}"
+        f"签到状态码: {code} | "
+        f"签到结果: {display_message}"
     )
 
     return True
 
 
-# ================= 主程序 =================
+# ============================================================
+# 主程序
+# ============================================================
 
 def main():
     log(
@@ -756,7 +711,6 @@ def main():
         log(
             "❌ 无可用 Cookie，程序终止"
         )
-
         return 1
 
     total = len(cookies)
@@ -767,18 +721,15 @@ def main():
         start=1,
     ):
         try:
-            success = run_account(
+            if run_account(
                 index,
                 total,
                 cookie,
-            )
-
-            if success:
+            ):
                 success_count += 1
 
         except Exception as exc:
-            # 防止程序本身发生未知异常时
-            # 被 GitHub Actions 误判成成功
+            # 未预料异常也必须让 Action 失败
             log(
                 f"❌ 账号 {index} "
                 "发生未处理异常 | "
